@@ -24,9 +24,9 @@
 
 struct Voxel {
     bool active = false;
-    int texId = 0; // Acts as our color/type ID
+    int texId = 0;
 
-    // New node properties
+    // Advanced node properties
     int age = 0;
     int type = 0;
     float weight = 1.0f;
@@ -48,6 +48,10 @@ class OpenGLWidget : public QOpenGLWidget, protected QOpenGLFunctions {
 public:
     OpenGLWidget(QWidget *parent = nullptr)
         : QOpenGLWidget(parent), gridSize(20), distance(25.0f), yaw(45.0f), pitch(35.0f), currentTextureIdx(0) {
+
+        // CRITICAL FIX: Allows the widget to receive WASD and 1-5 key presses
+        setFocusPolicy(Qt::StrongFocus);
+
         voxelGrid.resize(gridSize * gridSize * gridSize);
         target = QVector3D(0.0f, 0.0f, 5.0f);
 
@@ -63,11 +67,20 @@ public:
         timer->start(16); // ~60 FPS
     }
 
+    void setInfoLabel(QLabel* lbl) { infoLabel = lbl; }
+
 protected:
     void initializeGL() override {
         initializeOpenGLFunctions();
         glEnable(GL_DEPTH_TEST);
         glClearColor(0.5f, 0.7f, 1.0f, 1.0f);
+
+        // Initialize Procedural Textures
+        textures.push_back(createTexture(QColor(139, 69, 19), "Dirt"));
+        textures.push_back(createTexture(QColor(128, 128, 128), "Stone"));
+        textures.push_back(createTexture(QColor(34, 139, 34), "Grass"));
+        textures.push_back(createTexture(QColor(178, 34, 34), "Brick"));
+        textures.push_back(createTexture(QColor(240, 220, 150), "Sand"));
     }
 
     void resizeGL(int w, int h) override {
@@ -101,6 +114,8 @@ protected:
     }
 
     void mousePressEvent(QMouseEvent *event) override {
+        setFocus(); // Ensure we get keyboard focus when clicking
+
         QVector3D origin = getRayOrigin(event->localPos());
         QVector3D dir = getRayDirection(event->localPos());
 
@@ -161,6 +176,7 @@ protected:
             } else if (event->button() == Qt::MiddleButton) {
                 if (hitVoxel) {
                     currentTextureIdx = hitTexId;
+                    updateInfoLabel();
                     qDebug() << "Picked block type:" << currentTextureIdx;
                     update();
                 }
@@ -195,9 +211,10 @@ protected:
         pressedKeys.insert(event->key());
         if (event->key() >= Qt::Key_1 && event->key() <= Qt::Key_5) {
             currentTextureIdx = event->key() - Qt::Key_1;
-            qDebug() << "Changed selected block type to:" << currentTextureIdx;
+            updateInfoLabel();
+            qDebug() << "Selected Texture ID:" << currentTextureIdx;
+            update();
         }
-        update();
     }
 
     void keyReleaseEvent(QKeyEvent *event) override {
@@ -205,6 +222,43 @@ protected:
     }
 
 private:
+    void updateInfoLabel() {
+        if (infoLabel) {
+            QStringList names = {"Dirt", "Stone", "Grass", "Brick", "Sand"};
+            infoLabel->setText("Selected: " + names[currentTextureIdx] + " | Left: Place | Right: Remove | WASD: Move | Space: Jump | 1-5: Texture");
+        }
+    }
+
+    GLuint createTexture(QColor baseColor, const QString& name) {
+        QImage img(64, 64, QImage::Format_RGBA8888);
+        img.fill(baseColor);
+
+        for(int i=0; i<64; ++i) {
+            for(int j=0; j<64; ++j) {
+                QColor c = baseColor;
+                if (name == "Brick") {
+                    if (i % 16 == 0 || j % 32 == 0 || (j % 32 == 16 && i % 32 > 15)) {
+                        c = QColor(200, 200, 200);
+                    }
+                } else {
+                    int noise = (qrand() % 40) - 20;
+                    c = QColor(qBound(0, c.red() + noise, 255),
+                               qBound(0, c.green() + noise, 255),
+                               qBound(0, c.blue() + noise, 255));
+                    if (i==0 || i==63 || j==0 || j==63) c = c.darker(150);
+                }
+                img.setPixelColor(i, j, c);
+            }
+        }
+        GLuint tex;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, img.width(), img.height(), 0, GL_RGBA, GL_UNSIGNED_BYTE, img.bits());
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        return tex;
+    }
+
     QVector3D getRayOrigin(const QPointF &mousePos) {
         float eyeX = target.x() + distance * cos(pitch * M_PI / 180.0f) * cos(yaw * M_PI / 180.0f);
         float eyeY = target.y() + distance * cos(pitch * M_PI / 180.0f) * sin(yaw * M_PI / 180.0f);
@@ -296,8 +350,12 @@ private:
         if (dt > 0.1f) dt = 0.1f;
         lastTime = currentTime;
 
-        QVector3D forward(cos(yaw * M_PI/180.0f), sin(yaw * M_PI/180.0f), 0);
-        QVector3D right(-sin(yaw * M_PI/180.0f), cos(yaw * M_PI/180.0f), 0);
+        // Calculate movement vectors relative to the camera
+        QVector3D eye = getRayOrigin(QPointF(width()/2.0, height()/2.0));
+        QVector3D forward = target - eye;
+        forward.setZ(0); // Project onto XY plane for horizontal movement
+        if (forward.length() > 0.001f) forward.normalize();
+        QVector3D right = QVector3D::crossProduct(forward, QVector3D(0,0,1)).normalized();
 
         QVector3D moveDir(0,0,0);
         if (pressedKeys.contains(Qt::Key_W)) moveDir = moveDir + forward;
@@ -348,6 +406,7 @@ private:
                                 QVector3D blockCenter(vMinX + 0.5f, vMinY + 0.5f, vMinZ + 0.5f);
                                 QVector3D diff = nextPos - blockCenter;
 
+                                // Collision logic for floors/ceilings vs walls
                                 if (std::abs(diff.z()) > std::abs(diff.x()) && std::abs(diff.z()) > std::abs(diff.y())) {
                                     if (diff.z() > 0) {
                                         nextPos.setZ(vMaxZ + r);
@@ -392,42 +451,38 @@ private:
         glPushMatrix();
         glTranslatef(x - gridSize / 2.0f, y - gridSize / 2.0f, z);
 
-        switch(type) {
-            case 0: glColor3f(0.8f, 0.2f, 0.2f); break; // Red
-            case 1: glColor3f(0.2f, 0.8f, 0.2f); break; // Green
-            case 2: glColor3f(0.5f, 0.3f, 0.1f); break; // Brown
-            case 3: glColor3f(0.6f, 0.6f, 0.6f); break; // Gray
-            case 4: glColor3f(0.2f, 0.4f, 0.9f); break; // Blue
-            default: glColor3f(1.0f, 1.0f, 1.0f); break;
-        }
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, textures[type]);
+        glColor3f(1.0, 1.0, 1.0); // Pure white so textures aren't tinted
 
         glBegin(GL_QUADS);
         // Front
-        glVertex3f(-0.5, -0.5, 0.5); glVertex3f( 0.5, -0.5, 0.5);
-        glVertex3f( 0.5, 0.5, 0.5); glVertex3f(-0.5, 0.5, 0.5);
+        glTexCoord2f(0,0); glVertex3f(-0.5, -0.5, 0.5); glTexCoord2f(1,0); glVertex3f( 0.5, -0.5, 0.5);
+        glTexCoord2f(1,1); glVertex3f( 0.5, 0.5, 0.5); glTexCoord2f(0,1); glVertex3f(-0.5, 0.5, 0.5);
         // Back
-        glVertex3f(-0.5, -0.5, -0.5); glVertex3f( 0.5, -0.5, -0.5);
-        glVertex3f( 0.5, 0.5, -0.5); glVertex3f(-0.5, 0.5, -0.5);
+        glTexCoord2f(0,0); glVertex3f(-0.5, -0.5, -0.5); glTexCoord2f(1,0); glVertex3f( 0.5, -0.5, -0.5);
+        glTexCoord2f(1,1); glVertex3f( 0.5, 0.5, -0.5); glTexCoord2f(0,1); glVertex3f(-0.5, 0.5, -0.5);
         // Left
-        glVertex3f(-0.5, -0.5, -0.5); glVertex3f(-0.5, -0.5, 0.5);
-        glVertex3f(-0.5, 0.5, 0.5); glVertex3f(-0.5, 0.5, -0.5);
+        glTexCoord2f(0,0); glVertex3f(-0.5, -0.5, -0.5); glTexCoord2f(1,0); glVertex3f(-0.5, -0.5, 0.5);
+        glTexCoord2f(1,1); glVertex3f(-0.5, 0.5, 0.5); glTexCoord2f(0,1); glVertex3f(-0.5, 0.5, -0.5);
         // Right
-        glVertex3f(0.5, -0.5, -0.5); glVertex3f(0.5, -0.5, 0.5);
-        glVertex3f(0.5, 0.5, 0.5); glVertex3f(0.5, 0.5, -0.5);
+        glTexCoord2f(0,0); glVertex3f(0.5, -0.5, -0.5); glTexCoord2f(1,0); glVertex3f(0.5, -0.5, 0.5);
+        glTexCoord2f(1,1); glVertex3f(0.5, 0.5, 0.5); glTexCoord2f(0,1); glVertex3f(0.5, 0.5, -0.5);
         // Top
-        glVertex3f(-0.5, 0.5, -0.5); glVertex3f( 0.5, 0.5, -0.5);
-        glVertex3f( 0.5, 0.5, 0.5); glVertex3f(-0.5, 0.5, 0.5);
+        glTexCoord2f(0,0); glVertex3f(-0.5, 0.5, -0.5); glTexCoord2f(1,0); glVertex3f( 0.5, 0.5, -0.5);
+        glTexCoord2f(1,1); glVertex3f( 0.5, 0.5, 0.5); glTexCoord2f(0,1); glVertex3f(-0.5, 0.5, 0.5);
         // Bottom
-        glVertex3f(-0.5, -0.5, -0.5); glVertex3f( 0.5, -0.5, -0.5);
-        glVertex3f( 0.5, -0.5, 0.5); glVertex3f(-0.5, -0.5, 0.5);
+        glTexCoord2f(0,0); glVertex3f(-0.5, -0.5, -0.5); glTexCoord2f(1,0); glVertex3f( 0.5, -0.5, -0.5);
+        glTexCoord2f(1,1); glVertex3f( 0.5, -0.5, 0.5); glTexCoord2f(0,1); glVertex3f(-0.5, -0.5, 0.5);
         glEnd();
+        glDisable(GL_TEXTURE_2D);
         glPopMatrix();
     }
 
     void drawPlayer() {
         glPushMatrix();
         glTranslatef(player.pos.x(), player.pos.y(), player.pos.z());
-        glColor3f(1.0f, 1.0f, 0.0f);
+        glColor3f(1.0f, 1.0f, 0.0f); // Yellow player
         glBegin(GL_QUADS);
         float r = 0.4f;
         // Front
@@ -455,8 +510,10 @@ private:
     QSet<int> pressedKeys;
     QPoint lastMousePosition;
     std::vector<Voxel> voxelGrid;
+    std::vector<GLuint> textures;
     Entity player;
     QTime lastTime;
+    QLabel* infoLabel = nullptr;
 };
 
 int main(int argc, char *argv[]) {
@@ -471,9 +528,11 @@ int main(int argc, char *argv[]) {
     OpenGLWidget* glWidget = new OpenGLWidget();
     layout->addWidget(glWidget);
 
-    QLabel* lbl = new QLabel("Left: Place | Right: Remove | Middle Click: Pick | Middle Drag: Rotate | Scroll: Zoom | WASD: Move | Space: Jump | 1-5: Color");
-    lbl->setStyleSheet("color: yellow; background: rgba(0,0,0,150); padding: 5px;");
+    QLabel* lbl = new QLabel("Selected: Dirt | Left: Place | Right: Remove | Middle Click: Pick | Middle Drag: Rotate | Scroll: Zoom | WASD: Move | Space: Jump | 1-5: Texture");
+    lbl->setStyleSheet("color: yellow; background: rgba(0,0,0,150); padding: 5px; font-weight: bold;");
     layout->addWidget(lbl);
+
+    glWidget->setInfoLabel(lbl);
 
     w.setCentralWidget(central);
     w.resize(800, 600);
