@@ -478,13 +478,12 @@ private:
 
     void triggerInteraction(int voxelIdx, int face) {
         qint64 now = QDateTime::currentMSecsSinceEpoch();
-        if (now - lastInteractionTime < 2000) return;
+        if (now - lastInteractionTime < 2000) return; // cooldown
         lastInteractionTime = now;
-
         FaceData& fd = voxelGrid[voxelIdx].faces[face];
         if (fd.interactive && fd.interactionType == 1) {
             QUrl u = fd.url.startsWith("http", Qt::CaseInsensitive) ? QUrl(fd.url) : QUrl::fromLocalFile(fd.url);
-            qDebug() << "Opening:" << u.toString();
+            qDebug().noquote() << ">>> OPENING POSTER:" << u.toString();
             QDesktopServices::openUrl(u);
         }
     }
@@ -610,6 +609,8 @@ private:
         QVector3D np = player.pos + player.vel * dt;
         float r = 0.4f;
         bool onGround = false;
+        bool touchedWall = false;
+        int wallIdx = -1, wallFace = -1, wallX = 0, wallY = 0, wallZ = 0;
 
         int minX = floor(np.x() + gridSize/2.0f - r), maxX = ceil(np.x() + gridSize/2.0f + r);
         int minY = floor(np.y() + gridSize/2.0f - r), maxY = ceil(np.y() + gridSize/2.0f + r);
@@ -647,12 +648,28 @@ private:
                         np.setY(diff.y() > 0 ? vMaxY + r : vMinY - r);
                         player.vel.setY(0);
                     }
-                    if (voxelGrid[idx].faces[hitFace].interactive) triggerInteraction(idx, hitFace);
+                    touchedWall = true;
+                    wallIdx = idx; wallFace = hitFace;
+                    wallX = bx; wallY = by; wallZ = bz;
                 }
             }
         }
 
         if (pressedKeys.contains(Qt::Key_Space) && onGround) player.vel.setZ(12.0f);
+        // --- Collision logging: only prints when the contacted block/face CHANGES ---
+        if (touchedWall) {
+            if (wallIdx != lastCollideIdx || wallFace != lastCollideFace) {
+                logCollision(wallIdx, wallFace, wallX, wallY, wallZ);
+                lastCollideIdx = wallIdx;
+                lastCollideFace = wallFace;
+            }
+            if (voxelGrid[wallIdx].faces[wallFace].interactive) {
+                triggerInteraction(wallIdx, wallFace);
+            }
+        } else {
+            lastCollideIdx = -1;
+            lastCollideFace = -1;
+        }
         if (np.z() < -10.0f) { np.setZ(3.0f); player.vel.setZ(0); }
         player.pos = np;
     }
@@ -688,6 +705,28 @@ private:
             glTexCoord2f(1,1); glVertex3f(0.5,0.5,0.5);   glTexCoord2f(0,1); glVertex3f(-0.5,0.5,0.5); break;
         }
         glEnd();
+    }
+
+    QString faceName(int f) const {
+        switch(f) {
+            case FACE_X_NEG: return "LEFT(-X)";
+            case FACE_X_POS: return "RIGHT(+X)";
+            case FACE_Y_NEG: return "BACK(-Y)";
+            case FACE_Y_POS: return "FRONT(+Y)";
+            case FACE_Z_NEG: return "BOTTOM(-Z)";
+            case FACE_Z_POS: return "TOP(+Z)";
+        }
+        return "?";
+    }
+
+    void logCollision(int idx, int face, int bx, int by, int bz) {
+        const FaceData& fd = voxelGrid[idx].faces[face];
+        QString msg = QString("BUMP  voxel(%1,%2,%3) face=%4 tex=%5")
+            .arg(bx).arg(by).arg(bz)
+            .arg(faceName(face)).arg(fd.texId);
+        if (fd.interactive)        msg += QString("  [POSTER] url=%1").arg(fd.url);
+        if (!fd.imagePath.isEmpty()) msg += QString("  img=%1").arg(fd.imagePath);
+        qDebug().noquote() << msg;
     }
 
     void drawVoxel(int x, int y, int z) {
@@ -746,6 +785,8 @@ private:
     QTime lastTime;
     QLabel* infoLabel = nullptr;
     qint64 lastInteractionTime;
+    int lastCollideIdx = -1;
+    int lastCollideFace = -1;
 };
 
 int main(int argc, char *argv[]) {
