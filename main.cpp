@@ -63,6 +63,15 @@ struct Voxel {
 
 struct Entity { QVector3D pos, vel; };
 
+struct TargetInfo {
+    bool valid = false;
+    QVector3D hitBlock;       // center of block you're looking at
+    QVector3D adjacentBlock;  // where a new block would be placed
+    int voxelIdx = -1;
+    int face = -1;
+    int texId = -1;
+};
+
 class OpenGLWidget : public QOpenGLWidget, protected QOpenGLFunctions {
     Q_OBJECT
 public:
@@ -196,6 +205,8 @@ protected:
     void initializeGL() override {
         initializeOpenGLFunctions();
         glEnable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         glClearColor(0.4f, 0.6f, 0.9f, 1.0f);
 
         textures.push_back(createTexture(QColor(139, 69, 19), "Dirt"));
@@ -237,6 +248,13 @@ protected:
             if (voxelGrid[index(x, y, z)].active) drawVoxel(x, y, z);
 
         if (!firstPerson) drawPlayer();
+
+        // ---- selection feedback ----
+        QPointF aim = firstPerson ? QPointF(width()/2.0, height()/2.0)
+                                  : QPointF(lastMousePosition);
+        TargetInfo target = getTarget(aim);
+        if (target.valid) drawTargetHighlight(target);
+        if (firstPerson) drawCrosshair();
     }
 
     void mousePressEvent(QMouseEvent *event) override {
@@ -474,6 +492,73 @@ private:
         pressedKeys.clear(); // avoid stuck keys after modal dialogs
         updateInfoLabel();
         update();
+    }
+
+    TargetInfo getTarget(const QPointF& screenPos) {
+        TargetInfo t;
+        QVector3D origin, dir;
+        getViewRay(screenPos, origin, dir);
+        if (raycastVoxel(origin, dir, t.hitBlock, t.adjacentBlock, t.texId, t.face)) {
+            t.valid = true;
+            t.voxelIdx = voxelIndexFromWorld(t.hitBlock);
+        }
+        return t;
+    }
+
+    void drawCrosshair() {
+        glMatrixMode(GL_PROJECTION); glPushMatrix(); glLoadIdentity();
+        glOrtho(0, width(), height(), 0, -1, 1);
+        glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
+        glDisable(GL_DEPTH_TEST);
+
+        float cx = width() / 2.0f, cy = height() / 2.0f, s = 9.0f;
+        glLineWidth(2.0f);
+        glColor4f(1.0f, 1.0f, 1.0f, 0.9f);
+        glBegin(GL_LINES);
+        glVertex2f(cx - s, cy); glVertex2f(cx + s, cy);
+        glVertex2f(cx, cy - s); glVertex2f(cx, cy + s);
+        glEnd();
+
+        glEnable(GL_DEPTH_TEST);
+        glPopMatrix(); glMatrixMode(GL_PROJECTION); glPopMatrix(); glMatrixMode(GL_MODELVIEW);
+    }
+
+    void drawTargetHighlight(const TargetInfo& t) {
+        // --- Yellow wireframe around the targeted block ---
+        glPushMatrix();
+        glTranslatef(t.hitBlock.x(), t.hitBlock.y(), t.hitBlock.z());
+        glDisable(GL_TEXTURE_2D);
+        float e = 0.505f;
+        glLineWidth(2.5f);
+        glColor4f(1.0f, 0.9f, 0.2f, 1.0f);
+        glBegin(GL_LINES);
+        glVertex3f(-e,-e,-e); glVertex3f( e,-e,-e);  glVertex3f( e,-e,-e); glVertex3f( e, e,-e);
+        glVertex3f( e, e,-e); glVertex3f(-e, e,-e);  glVertex3f(-e, e,-e); glVertex3f(-e,-e,-e);
+        glVertex3f(-e,-e, e); glVertex3f( e,-e, e);  glVertex3f( e,-e, e); glVertex3f( e, e, e);
+        glVertex3f( e, e, e); glVertex3f(-e, e, e);  glVertex3f(-e, e, e); glVertex3f(-e,-e, e);
+        glVertex3f(-e,-e,-e); glVertex3f(-e,-e, e);  glVertex3f( e,-e,-e); glVertex3f( e,-e, e);
+        glVertex3f( e, e,-e); glVertex3f( e, e, e);  glVertex3f(-e, e,-e); glVertex3f(-e, e, e);
+        glEnd();
+
+        // --- Blue tint on the exact face being picked ---
+        glColor4f(0.3f, 0.7f, 1.0f, 0.45f);
+        drawFace(t.face);
+        glPopMatrix();
+
+        // --- Ghost preview of where the new block will go ---
+        glPushMatrix();
+        glTranslatef(t.adjacentBlock.x(), t.adjacentBlock.y(), t.adjacentBlock.z());
+        glColor4f(1.0f, 1.0f, 1.0f, 0.18f);
+        float g = 0.5f;
+        glBegin(GL_QUADS);
+        glVertex3f(-g,-g, g); glVertex3f( g,-g, g); glVertex3f( g, g, g); glVertex3f(-g, g, g);
+        glVertex3f(-g,-g,-g); glVertex3f( g,-g,-g); glVertex3f( g, g,-g); glVertex3f(-g, g,-g);
+        glVertex3f(-g,-g,-g); glVertex3f(-g,-g, g); glVertex3f(-g, g, g); glVertex3f(-g, g,-g);
+        glVertex3f( g,-g,-g); glVertex3f( g,-g, g); glVertex3f( g, g, g); glVertex3f( g, g,-g);
+        glVertex3f(-g, g,-g); glVertex3f( g, g,-g); glVertex3f( g, g, g); glVertex3f(-g, g, g);
+        glVertex3f(-g,-g,-g); glVertex3f( g,-g,-g); glVertex3f( g,-g, g); glVertex3f(-g,-g, g);
+        glEnd();
+        glPopMatrix();
     }
 
     void triggerInteraction(int voxelIdx, int face) {
