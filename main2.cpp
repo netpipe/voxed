@@ -11,7 +11,6 @@
 #include <QVBoxLayout>
 #include <QLabel>
 #include <QSet>
-#include <QTime>
 #include <vector>
 #include <cmath>
 #include <QDebug>
@@ -24,9 +23,9 @@
 
 struct Voxel {
     bool active = false;
-    int texId = 0; // Acts as our color/type ID
+    int texId = 0;
 
-    // New node properties
+    // New properties for advanced logic
     int age = 0;
     int type = 0;
     float weight = 1.0f;
@@ -49,12 +48,12 @@ public:
     OpenGLWidget(QWidget *parent = nullptr)
         : QOpenGLWidget(parent), gridSize(20), distance(25.0f), yaw(45.0f), pitch(35.0f), currentTextureIdx(0) {
         voxelGrid.resize(gridSize * gridSize * gridSize);
-        target = QVector3D(0.0f, 0.0f, 5.0f);
+        target = QVector3D(0.0f, 0.0f, 5.0f); // Look at the center of the grid
 
         player.pos = QVector3D(0.0f, 0.0f, 3.0f);
         player.vel = QVector3D(0.0f, 0.0f, 0.0f);
-        lastTime = QTime::currentTime();
 
+        // Physics loop
         QTimer *timer = new QTimer(this);
         connect(timer, &QTimer::timeout, this, [this]() {
             updatePhysics();
@@ -67,7 +66,14 @@ protected:
     void initializeGL() override {
         initializeOpenGLFunctions();
         glEnable(GL_DEPTH_TEST);
-        glClearColor(0.5f, 0.7f, 1.0f, 1.0f);
+        glClearColor(0.5f, 0.7f, 1.0f, 1.0f); // Sky blue
+
+        // Generate procedural textures
+        textures.push_back(createTexture(QColor(139, 69, 19)));  // Dirt
+        textures.push_back(createTexture(QColor(128, 128, 128))); // Stone
+        textures.push_back(createTexture(QColor(34, 139, 34)));   // Grass
+        textures.push_back(createTexture(QColor(178, 34, 34)));   // Red Brick
+        textures.push_back(createTexture(QColor(240, 240, 240))); // White
     }
 
     void resizeGL(int w, int h) override {
@@ -82,6 +88,7 @@ protected:
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         glLoadIdentity();
 
+        // Orbit Camera
         float eyeX = target.x() + distance * cos(pitch * M_PI / 180.0f) * cos(yaw * M_PI / 180.0f);
         float eyeY = target.y() + distance * cos(pitch * M_PI / 180.0f) * sin(yaw * M_PI / 180.0f);
         float eyeZ = target.z() + distance * sin(pitch * M_PI / 180.0f);
@@ -97,12 +104,14 @@ protected:
                 }
             }
         }
+
         drawPlayer();
     }
 
     void mousePressEvent(QMouseEvent *event) override {
-        QVector3D origin = getRayOrigin(event->localPos());
-        QVector3D dir = getRayDirection(event->localPos());
+        QVector3D origin = unproject(event->pos(), 0.001f);
+        QVector3D farPlane = unproject(event->pos(), 0.999f);
+        QVector3D dir = (farPlane - origin).normalized();
 
         QVector3D hitBlock, adjacentBlock;
         int hitTexId = -1;
@@ -111,6 +120,7 @@ protected:
         bool hitGround = false;
         int gx = -1, gy = -1;
 
+        // Fallback: If no voxel was hit, check if we clicked the Z=0 floor plane
         if (!hitVoxel) {
             if (std::abs(dir.z()) > 1e-5f) {
                 float t = -origin.z() / dir.z();
@@ -133,7 +143,9 @@ protected:
                     ay = adjacentBlock.y() + gridSize / 2.0f;
                     az = adjacentBlock.z();
                 } else {
-                    ax = gx; ay = gy; az = 0;
+                    ax = gx;
+                    ay = gy;
+                    az = 0; // Place on the floor
                 }
 
                 if (ax >= 0 && ax < gridSize && ay >= 0 && ay < gridSize && az >= 0 && az < gridSize) {
@@ -161,7 +173,7 @@ protected:
             } else if (event->button() == Qt::MiddleButton) {
                 if (hitVoxel) {
                     currentTextureIdx = hitTexId;
-                    qDebug() << "Picked block type:" << currentTextureIdx;
+                    qDebug() << "Picked texture ID:" << currentTextureIdx;
                     update();
                 }
             }
@@ -195,7 +207,6 @@ protected:
         pressedKeys.insert(event->key());
         if (event->key() >= Qt::Key_1 && event->key() <= Qt::Key_5) {
             currentTextureIdx = event->key() - Qt::Key_1;
-            qDebug() << "Changed selected block type to:" << currentTextureIdx;
         }
         update();
     }
@@ -205,37 +216,38 @@ protected:
     }
 
 private:
-    QVector3D getRayOrigin(const QPointF &mousePos) {
-        float eyeX = target.x() + distance * cos(pitch * M_PI / 180.0f) * cos(yaw * M_PI / 180.0f);
-        float eyeY = target.y() + distance * cos(pitch * M_PI / 180.0f) * sin(yaw * M_PI / 180.0f);
-        float eyeZ = target.z() + distance * sin(pitch * M_PI / 180.0f);
-        return QVector3D(eyeX, eyeY, eyeZ);
+    GLuint createTexture(const QColor &baseColor) {
+        QImage img(16, 16, QImage::Format_RGBA8888);
+        img.fill(baseColor);
+        for(int i=0; i<16; ++i) {
+            for(int j=0; j<16; ++j) {
+                if (i==0 || i==15 || j==0 || j==15) img.setPixelColor(i, j, baseColor.darker(150));
+                else if ((i + j) % 4 == 0) img.setPixelColor(i, j, baseColor.lighter(120));
+            }
+        }
+        GLuint tex;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, img.width(), img.height(), 0, GL_RGBA, GL_UNSIGNED_BYTE, img.bits());
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        return tex;
     }
 
-    QVector3D getRayDirection(const QPointF &mousePos) {
-        QVector3D eye = getRayOrigin(mousePos);
-        QVector3D forward = (target - eye).normalized();
-        QVector3D worldUp(0.0, 0.0, 1.0);
-        QVector3D right = QVector3D::crossProduct(forward, worldUp).normalized();
-        QVector3D up = QVector3D::crossProduct(right, forward).normalized();
-
-        float w = width();
-        float h = height();
-        if (w <= 0) w = 800;
-        if (h <= 0) h = 600;
-
-        float ndcX = (2.0f * mousePos.x() / w) - 1.0f;
-        float ndcY = 1.0f - (2.0f * mousePos.y() / h);
-        float aspect = w / h;
-        float tanFov = tan(45.0f * 0.5f * M_PI / 180.0f);
-
-        QVector3D rayDirLocal(ndcX * aspect * tanFov, ndcY * tanFov, -1.0f);
-        return (right * rayDirLocal.x() + up * rayDirLocal.y() + forward).normalized();
+    QVector3D unproject(const QPointF &mousePos, float depth) {
+        GLint viewport[4];
+        glGetIntegerv(GL_VIEWPORT, viewport);
+        GLdouble modelview[16]; glGetDoublev(GL_MODELVIEW_MATRIX, modelview);
+        GLdouble projection[16]; glGetDoublev(GL_PROJECTION_MATRIX, projection);
+        GLdouble posX, posY, posZ;
+        gluUnProject(mousePos.x(), viewport[3] - mousePos.y() - 1, depth, modelview, projection, viewport, &posX, &posY, &posZ);
+        return QVector3D(posX, posY, posZ);
     }
 
+    // Robust DDA Raycaster
     bool raycastVoxel(QVector3D origin, QVector3D dir, QVector3D &hitBlockWorld, QVector3D &adjacentWorld, int &hitTexId) {
         QVector3D gridOrigin = QVector3D(origin.x() + gridSize / 2.0f, origin.y() + gridSize / 2.0f, origin.z());
-        gridOrigin += dir * 0.0001f;
+        gridOrigin += dir * 0.0001f; // Shift slightly to avoid boundary bugs
 
         int x = floor(gridOrigin.x());
         int y = floor(gridOrigin.y());
@@ -280,22 +292,27 @@ private:
             prevX = x; prevY = y; prevZ = z;
 
             if (tMaxX < tMaxY) {
-                if (tMaxX < tMaxZ) { x += stepX; tMaxX += tDeltaX; }
-                else { z += stepZ; tMaxZ += tDeltaZ; }
+                if (tMaxX < tMaxZ) {
+                    x += stepX;
+                    tMaxX += tDeltaX;
+                } else {
+                    z += stepZ;
+                    tMaxZ += tDeltaZ;
+                }
             } else {
-                if (tMaxY < tMaxZ) { y += stepY; tMaxY += tDeltaY; }
-                else { z += stepZ; tMaxZ += tDeltaZ; }
+                if (tMaxY < tMaxZ) {
+                    y += stepY;
+                    tMaxY += tDeltaY;
+                } else {
+                    z += stepZ;
+                    tMaxZ += tDeltaZ;
+                }
             }
         }
         return false;
     }
 
     void updatePhysics() {
-        QTime currentTime = QTime::currentTime();
-        float dt = lastTime.msecsTo(currentTime) / 1000.0f;
-        if (dt > 0.1f) dt = 0.1f;
-        lastTime = currentTime;
-
         QVector3D forward(cos(yaw * M_PI/180.0f), sin(yaw * M_PI/180.0f), 0);
         QVector3D right(-sin(yaw * M_PI/180.0f), cos(yaw * M_PI/180.0f), 0);
 
@@ -307,22 +324,19 @@ private:
 
         if (moveDir.length() > 0) {
             moveDir.normalize();
-            player.vel.setX(player.vel.x() + moveDir.x() * 25.0f * dt);
-            player.vel.setY(player.vel.y() + moveDir.y() * 25.0f * dt);
+            player.vel.setX(player.vel.x() + moveDir.x() * 0.005f);
+            player.vel.setY(player.vel.y() + moveDir.y() * 0.005f);
         }
 
-        player.vel.setZ(player.vel.z() - 25.0f * dt); // gravity
+        player.vel.setZ(player.vel.z() - 0.002f); // gravity
+        player.vel.setX(player.vel.x() * 0.9f);   // damping
+        player.vel.setY(player.vel.y() * 0.9f);
+        player.vel.setZ(player.vel.z() * 0.95f);
 
-        float damp = 1.0f - 10.0f * dt;
-        if (damp < 0) damp = 0;
-        player.vel.setX(player.vel.x() * damp);
-        player.vel.setY(player.vel.y() * damp);
-
-        QVector3D nextPos = player.pos + player.vel * dt;
+        QVector3D nextPos = player.pos + player.vel;
         float r = 0.4f;
 
         bool collided_wall = false;
-        bool onGround = false;
 
         int minX = floor(nextPos.x() + gridSize/2.0f - r);
         int maxX = ceil(nextPos.x() + gridSize/2.0f + r);
@@ -348,20 +362,19 @@ private:
                                 QVector3D blockCenter(vMinX + 0.5f, vMinY + 0.5f, vMinZ + 0.5f);
                                 QVector3D diff = nextPos - blockCenter;
 
+                                // Smart Collision: Detect if we hit a wall or a floor
                                 if (std::abs(diff.z()) > std::abs(diff.x()) && std::abs(diff.z()) > std::abs(diff.y())) {
+                                    // Floor or Ceiling (Z dominant)
                                     if (diff.z() > 0) {
                                         nextPos.setZ(vMaxZ + r);
                                         player.vel.setZ(0);
-                                        onGround = true;
                                     } else {
                                         nextPos.setZ(vMinZ - r);
                                         player.vel.setZ(0);
                                     }
                                 } else {
+                                    // Wall (X or Y dominant)
                                     collided_wall = true;
-                                    int wallType = voxelGrid[idx].getType();
-                                    qDebug() << "Entity touched a wall! Block type:" << wallType << "Age:" << voxelGrid[idx].getAge();
-
                                     if (std::abs(diff.x()) > std::abs(diff.y())) {
                                         nextPos.setX(diff.x() > 0 ? vMaxX + r : vMinX - r);
                                         player.vel.setX(0);
@@ -377,50 +390,40 @@ private:
             }
         }
 
-        if (pressedKeys.contains(Qt::Key_Space) && onGround) {
-            player.vel.setZ(12.0f);
-        }
-
+        if (collided_wall) qDebug() << "Entity touched a non-floor texture (Wall)!";
         if (nextPos.z() < -10.0f) { nextPos.setZ(3.0f); player.vel.setZ(0); }
         player.pos = nextPos;
     }
 
     void drawVoxel(int x, int y, int z) {
-        int idx = index(x, y, z);
-        int type = voxelGrid[idx].texId;
-
         glPushMatrix();
         glTranslatef(x - gridSize / 2.0f, y - gridSize / 2.0f, z);
-
-        switch(type) {
-            case 0: glColor3f(0.8f, 0.2f, 0.2f); break; // Red
-            case 1: glColor3f(0.2f, 0.8f, 0.2f); break; // Green
-            case 2: glColor3f(0.5f, 0.3f, 0.1f); break; // Brown
-            case 3: glColor3f(0.6f, 0.6f, 0.6f); break; // Gray
-            case 4: glColor3f(0.2f, 0.4f, 0.9f); break; // Blue
-            default: glColor3f(1.0f, 1.0f, 1.0f); break;
-        }
-
+        glEnable(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, textures[voxelGrid[index(x, y, z)].texId]);
+        glColor3f(1.0, 1.0, 1.0);
         glBegin(GL_QUADS);
+
         // Front
-        glVertex3f(-0.5, -0.5, 0.5); glVertex3f( 0.5, -0.5, 0.5);
-        glVertex3f( 0.5, 0.5, 0.5); glVertex3f(-0.5, 0.5, 0.5);
+        glTexCoord2f(0,0); glVertex3f(-0.5, -0.5, 0.5); glTexCoord2f(1,0); glVertex3f( 0.5, -0.5, 0.5);
+        glTexCoord2f(1,1); glVertex3f( 0.5, 0.5, 0.5); glTexCoord2f(0,1); glVertex3f(-0.5, 0.5, 0.5);
         // Back
-        glVertex3f(-0.5, -0.5, -0.5); glVertex3f( 0.5, -0.5, -0.5);
-        glVertex3f( 0.5, 0.5, -0.5); glVertex3f(-0.5, 0.5, -0.5);
+        glTexCoord2f(0,0); glVertex3f(-0.5, -0.5, -0.5); glTexCoord2f(1,0); glVertex3f( 0.5, -0.5, -0.5);
+        glTexCoord2f(1,1); glVertex3f( 0.5, 0.5, -0.5); glTexCoord2f(0,1); glVertex3f(-0.5, 0.5, -0.5);
         // Left
-        glVertex3f(-0.5, -0.5, -0.5); glVertex3f(-0.5, -0.5, 0.5);
-        glVertex3f(-0.5, 0.5, 0.5); glVertex3f(-0.5, 0.5, -0.5);
+        glTexCoord2f(0,0); glVertex3f(-0.5, -0.5, -0.5); glTexCoord2f(1,0); glVertex3f(-0.5, -0.5, 0.5);
+        glTexCoord2f(1,1); glVertex3f(-0.5, 0.5, 0.5); glTexCoord2f(0,1); glVertex3f(-0.5, 0.5, -0.5);
         // Right
-        glVertex3f(0.5, -0.5, -0.5); glVertex3f(0.5, -0.5, 0.5);
-        glVertex3f(0.5, 0.5, 0.5); glVertex3f(0.5, 0.5, -0.5);
+        glTexCoord2f(0,0); glVertex3f(0.5, -0.5, -0.5); glTexCoord2f(1,0); glVertex3f(0.5, -0.5, 0.5);
+        glTexCoord2f(1,1); glVertex3f(0.5, 0.5, 0.5); glTexCoord2f(0,1); glVertex3f(0.5, 0.5, -0.5);
         // Top
-        glVertex3f(-0.5, 0.5, -0.5); glVertex3f( 0.5, 0.5, -0.5);
-        glVertex3f( 0.5, 0.5, 0.5); glVertex3f(-0.5, 0.5, 0.5);
+        glTexCoord2f(0,0); glVertex3f(-0.5, 0.5, -0.5); glTexCoord2f(1,0); glVertex3f( 0.5, 0.5, -0.5);
+        glTexCoord2f(1,1); glVertex3f( 0.5, 0.5, 0.5); glTexCoord2f(0,1); glVertex3f(-0.5, 0.5, 0.5);
         // Bottom
-        glVertex3f(-0.5, -0.5, -0.5); glVertex3f( 0.5, -0.5, -0.5);
-        glVertex3f( 0.5, -0.5, 0.5); glVertex3f(-0.5, -0.5, 0.5);
+        glTexCoord2f(0,0); glVertex3f(-0.5, -0.5, -0.5); glTexCoord2f(1,0); glVertex3f( 0.5, -0.5, -0.5);
+        glTexCoord2f(1,1); glVertex3f( 0.5, -0.5, 0.5); glTexCoord2f(0,1); glVertex3f(-0.5, -0.5, 0.5);
+
         glEnd();
+        glDisable(GL_TEXTURE_2D);
         glPopMatrix();
     }
 
@@ -455,8 +458,8 @@ private:
     QSet<int> pressedKeys;
     QPoint lastMousePosition;
     std::vector<Voxel> voxelGrid;
+    std::vector<GLuint> textures;
     Entity player;
-    QTime lastTime;
 };
 
 int main(int argc, char *argv[]) {
@@ -471,7 +474,7 @@ int main(int argc, char *argv[]) {
     OpenGLWidget* glWidget = new OpenGLWidget();
     layout->addWidget(glWidget);
 
-    QLabel* lbl = new QLabel("Left: Place | Right: Remove | Middle Click: Pick | Middle Drag: Rotate | Scroll: Zoom | WASD: Move | Space: Jump | 1-5: Color");
+    QLabel* lbl = new QLabel("Left: Place | Right: Remove | Middle Click: Pick Texture | Middle Drag: Rotate | Scroll: Zoom | WASD: Move | 1-5: Change Texture");
     lbl->setStyleSheet("color: yellow; background: rgba(0,0,0,150); padding: 5px;");
     layout->addWidget(lbl);
 

@@ -9,5 +9,6 @@ HEADERS +=
 
 INCLUDEPATH +=
 
-LIBS += -lglut -lGLU
-
+#LIBS += -lglut -lGLU
+#else:macos:
+LIBS += -framework GLUT -framework OpenGL -framework Cocoa

@@ -1,4 +1,4 @@
-#include <irrlicht/irrlicht.h>
+#include <irrlicht.h>
 #include <QApplication>
 #include <QWidget>
 #include <QVBoxLayout>
@@ -232,4 +232,3 @@ int main(int argc, char *argv[]) {
 }
 
 #include "main.moc"
-

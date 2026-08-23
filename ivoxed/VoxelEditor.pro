@@ -11,9 +11,9 @@ SOURCES += main.cpp \
 HEADERS +=            VoxelNode.h
 
 # Include paths for Irrlicht
-INCLUDEPATH += /path/to/irrlicht/include
+INCLUDEPATH += /Users/macbook2015/Downloads/irrlicht-1.8.5/include /Users/macbook2015/Desktop/brew/include/
 
 # Library paths for Irrlicht
-LIBS += -L/path/to/irrlicht/lib -lIrrlicht
+LIBS += -L/Users/macbook2015/Downloads/irrlicht-1.8.5/lib/mac -L/Users/macbook2015/Desktop/brew/lib -lpng -lIrrlicht -framework Foundation -framework OpenGL -framework Cocoa -framework Carbon -framework AppKit -framework IOKit
 
 # Add any other necessary Qt or system libraries here
