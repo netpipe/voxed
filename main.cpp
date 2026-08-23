@@ -678,8 +678,8 @@ private:
         QVector3D moveDir(0,0,0);
         if (pressedKeys.contains(Qt::Key_W)) moveDir += fwd;
         if (pressedKeys.contains(Qt::Key_S)) moveDir -= fwd;
-        if (pressedKeys.contains(Qt::Key_A)) moveDir -= rgt;
-        if (pressedKeys.contains(Qt::Key_D)) moveDir += rgt;
+        if (pressedKeys.contains(Qt::Key_D)) moveDir -= rgt;
+        if (pressedKeys.contains(Qt::Key_A)) moveDir += rgt;
 
         if (moveDir.length() > 0) {
             moveDir.normalize();
