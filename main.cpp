@@ -12,6 +12,17 @@
 #include <QLabel>
 #include <QSet>
 #include <QTime>
+#include <QDateTime>
+#include <QInputDialog>
+#include <QFileDialog>
+#include <QDesktopServices>
+#include <QUrl>
+#include <QMap>
+#include <QMenu>
+#include <QMenuBar>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonArray>
 #include <vector>
 #include <cmath>
 #include <QDebug>
@@ -22,11 +33,23 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+enum {
+    FACE_X_NEG = 0, FACE_X_POS = 1,
+    FACE_Y_NEG = 2, FACE_Y_POS = 3,
+    FACE_Z_NEG = 4, FACE_Z_POS = 5
+};
+
+struct FaceData {
+    int texId = 0;
+    bool interactive = false;
+    int interactionType = 0; // 0=none, 1=url/movie
+    QString url;
+    QString imagePath;       // custom poster image (reloaded on load)
+};
+
 struct Voxel {
     bool active = false;
-    int texId = 0;
-
-    // Advanced node properties
+    FaceData faces[6];
     int age = 0;
     int type = 0;
     float weight = 1.0f;
@@ -38,56 +61,156 @@ struct Voxel {
     float getAffector() const { return affectorValue; }
 };
 
-struct Entity {
-    QVector3D pos;
-    QVector3D vel;
-};
+struct Entity { QVector3D pos, vel; };
 
 class OpenGLWidget : public QOpenGLWidget, protected QOpenGLFunctions {
     Q_OBJECT
 public:
     OpenGLWidget(QWidget *parent = nullptr)
-        : QOpenGLWidget(parent), gridSize(20), distance(25.0f), yaw(45.0f), pitch(35.0f), currentTextureIdx(0) {
+        : QOpenGLWidget(parent), gridSize(20), distance(25.0f),
+          yaw(45.0f), pitch(35.0f), fpYaw(-90.0f), fpPitch(0.0f),
+          currentTextureIdx(0), firstPerson(false) {
 
-        // CRITICAL FIX: Allows the widget to receive WASD and 1-5 key presses
         setFocusPolicy(Qt::StrongFocus);
+        setMouseTracking(true);
 
         voxelGrid.resize(gridSize * gridSize * gridSize);
         target = QVector3D(0.0f, 0.0f, 5.0f);
 
-        player.pos = QVector3D(0.0f, 0.0f, 3.0f);
+        player.pos = QVector3D(0.0f, 0.0f, 2.0f);
         player.vel = QVector3D(0.0f, 0.0f, 0.0f);
         lastTime = QTime::currentTime();
+        lastInteractionTime = 0;
+        lastMousePosition = QPoint(400, 300);
 
         QTimer *timer = new QTimer(this);
         connect(timer, &QTimer::timeout, this, [this]() {
             updatePhysics();
             update();
         });
-        timer->start(16); // ~60 FPS
+        timer->start(16);
     }
 
     void setInfoLabel(QLabel* lbl) { infoLabel = lbl; }
+
+    // ---------- SAVE / LOAD ----------
+    void saveWorld() {
+        QString path = QFileDialog::getSaveFileName(this, "Save World", "world.json", "JSON (*.json)");
+        if (path.isEmpty()) return;
+
+        QJsonObject root;
+        root["gridSize"] = gridSize;
+        root["playerX"] = (double)player.pos.x();
+        root["playerY"] = (double)player.pos.y();
+        root["playerZ"] = (double)player.pos.z();
+
+        QJsonArray voxArr;
+        for (int x = 0; x < gridSize; ++x)
+        for (int y = 0; y < gridSize; ++y)
+        for (int z = 0; z < gridSize; ++z) {
+            int idx = index(x, y, z);
+            if (!voxelGrid[idx].active) continue;
+
+            QJsonObject vo;
+            vo["x"] = x; vo["y"] = y; vo["z"] = z;
+            vo["age"] = voxelGrid[idx].age;
+            vo["type"] = voxelGrid[idx].type;
+            vo["weight"] = (double)voxelGrid[idx].weight;
+            vo["affector"] = (double)voxelGrid[idx].affectorValue;
+
+            QJsonArray facesArr;
+            for (int f = 0; f < 6; ++f) {
+                const FaceData& fd = voxelGrid[idx].faces[f];
+                QJsonObject fo;
+                fo["tex"] = fd.texId;
+                fo["interactive"] = fd.interactive;
+                fo["itype"] = fd.interactionType;
+                fo["url"] = fd.url;
+                fo["img"] = fd.imagePath;
+                facesArr.append(fo);
+            }
+            vo["faces"] = facesArr;
+            voxArr.append(vo);
+        }
+        root["voxels"] = voxArr;
+
+        QFile file(path);
+        if (file.open(QIODevice::WriteOnly)) {
+            file.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
+            file.close();
+            qDebug() << "World saved:" << path << "(" << voxArr.size() << "voxels)";
+        }
+    }
+
+    void loadWorld() {
+        QString path = QFileDialog::getOpenFileName(this, "Load World", "", "JSON (*.json)");
+        if (path.isEmpty()) return;
+
+        QFile file(path);
+        if (!file.open(QIODevice::ReadOnly)) return;
+        QJsonDocument doc = QJsonDocument::fromJson(file.readAll());
+        file.close();
+        QJsonObject root = doc.object();
+
+        int gs = root["gridSize"].toInt(20);
+        gridSize = gs;
+        voxelGrid.assign(gridSize * gridSize * gridSize, Voxel());
+
+        player.pos = QVector3D(root["playerX"].toDouble(0), root["playerY"].toDouble(0), root["playerZ"].toDouble(2));
+        player.vel = QVector3D(0,0,0);
+
+        makeCurrent(); // GL needed for texture creation
+        QJsonArray voxArr = root["voxels"].toArray();
+        for (const QJsonValue& v : voxArr) {
+            QJsonObject vo = v.toObject();
+            int x = vo["x"].toInt(), y = vo["y"].toInt(), z = vo["z"].toInt();
+            if (x < 0 || x >= gridSize || y < 0 || y >= gridSize || z < 0 || z >= gridSize) continue;
+
+            Voxel& vx = voxelGrid[index(x, y, z)];
+            vx.active = true;
+            vx.age = vo["age"].toInt(0);
+            vx.type = vo["type"].toInt(0);
+            vx.weight = (float)vo["weight"].toDouble(1.0);
+            vx.affectorValue = (float)vo["affector"].toDouble(0.0);
+
+            QJsonArray facesArr = vo["faces"].toArray();
+            for (int f = 0; f < 6 && f < facesArr.size(); ++f) {
+                QJsonObject fo = facesArr[f].toObject();
+                FaceData& fd = vx.faces[f];
+                fd.texId = fo["tex"].toInt(0);
+                fd.interactive = fo["interactive"].toBool(false);
+                fd.interactionType = fo["itype"].toInt(0);
+                fd.url = fo["url"].toString();
+                fd.imagePath = fo["img"].toString();
+                if (!fd.imagePath.isEmpty()) {
+                    fd.texId = getTextureForPath(fd.imagePath); // rebuild custom texture
+                }
+            }
+        }
+        doneCurrent();
+        update();
+        qDebug() << "World loaded:" << path << "(" << voxArr.size() << "voxels)";
+    }
 
 protected:
     void initializeGL() override {
         initializeOpenGLFunctions();
         glEnable(GL_DEPTH_TEST);
-        glClearColor(0.5f, 0.7f, 1.0f, 1.0f);
+        glClearColor(0.4f, 0.6f, 0.9f, 1.0f);
 
-        // Initialize Procedural Textures
         textures.push_back(createTexture(QColor(139, 69, 19), "Dirt"));
         textures.push_back(createTexture(QColor(128, 128, 128), "Stone"));
         textures.push_back(createTexture(QColor(34, 139, 34), "Grass"));
         textures.push_back(createTexture(QColor(178, 34, 34), "Brick"));
         textures.push_back(createTexture(QColor(240, 220, 150), "Sand"));
+        textures.push_back(createTexture(QColor(50, 50, 200), "Poster"));
     }
 
     void resizeGL(int w, int h) override {
         glViewport(0, 0, w, h);
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
-        gluPerspective(45.0, static_cast<double>(w) / h, 0.1, 100.0);
+        gluPerspective(60.0, static_cast<double>(w) / h, 0.1, 100.0);
         glMatrixMode(GL_MODELVIEW);
     }
 
@@ -95,113 +218,133 @@ protected:
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
         glLoadIdentity();
 
-        float eyeX = target.x() + distance * cos(pitch * M_PI / 180.0f) * cos(yaw * M_PI / 180.0f);
-        float eyeY = target.y() + distance * cos(pitch * M_PI / 180.0f) * sin(yaw * M_PI / 180.0f);
-        float eyeZ = target.z() + distance * sin(pitch * M_PI / 180.0f);
-
-        gluLookAt(eyeX, eyeY, eyeZ, target.x(), target.y(), target.z(), 0.0, 0.0, 1.0);
-
-        for (int x = 0; x < gridSize; ++x) {
-            for (int y = 0; y < gridSize; ++y) {
-                for (int z = 0; z < gridSize; ++z) {
-                    if (voxelGrid[index(x, y, z)].active) {
-                        drawVoxel(x, y, z);
-                    }
-                }
-            }
+        if (firstPerson) {
+            float ex = player.pos.x(), ey = player.pos.y(), ez = player.pos.z() + 1.2f;
+            float lx = ex + cos(fpPitch*M_PI/180.0f) * cos(fpYaw*M_PI/180.0f);
+            float ly = ey + cos(fpPitch*M_PI/180.0f) * sin(fpYaw*M_PI/180.0f);
+            float lz = ez + sin(fpPitch*M_PI/180.0f);
+            gluLookAt(ex, ey, ez, lx, ly, lz, 0.0, 0.0, 1.0);
+        } else {
+            float eyeX = target.x() + distance * cos(pitch*M_PI/180.0f) * cos(yaw*M_PI/180.0f);
+            float eyeY = target.y() + distance * cos(pitch*M_PI/180.0f) * sin(yaw*M_PI/180.0f);
+            float eyeZ = target.z() + distance * sin(pitch*M_PI/180.0f);
+            gluLookAt(eyeX, eyeY, eyeZ, target.x(), target.y(), target.z(), 0.0, 0.0, 1.0);
         }
-        drawPlayer();
+
+        for (int x = 0; x < gridSize; ++x)
+        for (int y = 0; y < gridSize; ++y)
+        for (int z = 0; z < gridSize; ++z)
+            if (voxelGrid[index(x, y, z)].active) drawVoxel(x, y, z);
+
+        if (!firstPerson) drawPlayer();
     }
 
     void mousePressEvent(QMouseEvent *event) override {
-        setFocus(); // Ensure we get keyboard focus when clicking
+        setFocus();
+        lastMousePosition = event->pos();
 
-        QVector3D origin = getRayOrigin(event->localPos());
-        QVector3D dir = getRayDirection(event->localPos());
+        if (firstPerson && event->button() == Qt::RightButton) {
+            rightPressPos = event->pos();
+            rightDragged = false;
+            return; // right-drag = look; release without drag = delete
+        }
+
+        QVector3D origin, dir;
+        getViewRay(event->localPos(), origin, dir);
 
         QVector3D hitBlock, adjacentBlock;
-        int hitTexId = -1;
-        bool hitVoxel = raycastVoxel(origin, dir, hitBlock, adjacentBlock, hitTexId);
+        int hitTexId = -1, hitFace = -1;
+        bool hitVoxel = raycastVoxel(origin, dir, hitBlock, adjacentBlock, hitTexId, hitFace);
 
         bool hitGround = false;
         int gx = -1, gy = -1;
-
-        if (!hitVoxel) {
-            if (std::abs(dir.z()) > 1e-5f) {
-                float t = -origin.z() / dir.z();
-                if (t > 0) {
-                    QVector3D groundHit = origin + dir * t;
-                    gx = floor(groundHit.x() + gridSize / 2.0f);
-                    gy = floor(groundHit.y() + gridSize / 2.0f);
-                    if (gx >= 0 && gx < gridSize && gy >= 0 && gy < gridSize) {
-                        hitGround = true;
-                    }
-                }
+        if (!hitVoxel && !firstPerson && std::abs(dir.z()) > 1e-5f) {
+            float t = -origin.z() / dir.z();
+            if (t > 0) {
+                QVector3D gp = origin + dir * t;
+                gx = floor(gp.x() + gridSize/2.0f);
+                gy = floor(gp.y() + gridSize/2.0f);
+                if (gx >= 0 && gx < gridSize && gy >= 0 && gy < gridSize) hitGround = true;
             }
         }
 
-        if (hitVoxel || hitGround) {
-            if (event->button() == Qt::LeftButton) {
-                int ax, ay, az;
-                if (hitVoxel) {
-                    ax = adjacentBlock.x() + gridSize / 2.0f;
-                    ay = adjacentBlock.y() + gridSize / 2.0f;
-                    az = adjacentBlock.z();
-                } else {
-                    ax = gx; ay = gy; az = 0;
-                }
+        if (!(hitVoxel || hitGround)) return;
 
-                if (ax >= 0 && ax < gridSize && ay >= 0 && ay < gridSize && az >= 0 && az < gridSize) {
-                    int idx = index(ax, ay, az);
-                    if (!voxelGrid[idx].active) {
-                        voxelGrid[idx].active = true;
-                        voxelGrid[idx].texId = currentTextureIdx;
-                        voxelGrid[idx].type = currentTextureIdx;
-                        voxelGrid[idx].weight = 1.0f;
-                        voxelGrid[idx].age = 0;
-                        update();
-                    }
+        if (event->button() == Qt::LeftButton) {
+            if (hitVoxel && hitFace >= 0) {
+                int idx = voxelIndexFromWorld(hitBlock);
+                if (idx >= 0 && voxelGrid[idx].faces[hitFace].interactive) {
+                    triggerInteraction(idx, hitFace);
+                    return;
                 }
-            } else if (event->button() == Qt::RightButton) {
-                if (hitVoxel) {
-                    int hx = hitBlock.x() + gridSize / 2.0f;
-                    int hy = hitBlock.y() + gridSize / 2.0f;
-                    int hz = hitBlock.z();
+            }
+            int ax, ay, az;
+            if (hitVoxel) {
+                ax = adjacentBlock.x() + gridSize/2.0f;
+                ay = adjacentBlock.y() + gridSize/2.0f;
+                az = adjacentBlock.z();
+            } else { ax = gx; ay = gy; az = 0; }
 
-                    if (hx >= 0 && hx < gridSize && hy >= 0 && hy < gridSize && hz >= 0 && hz < gridSize) {
-                        voxelGrid[index(hx, hy, hz)].active = false;
-                        update();
-                    }
+            if (ax >= 0 && ax < gridSize && ay >= 0 && ay < gridSize && az >= 0 && az < gridSize) {
+                int idx = index(ax, ay, az);
+                if (!voxelGrid[idx].active) {
+                    voxelGrid[idx].active = true;
+                    for (int f = 0; f < 6; f++) voxelGrid[idx].faces[f].texId = currentTextureIdx;
+                    voxelGrid[idx].type = currentTextureIdx;
+                    voxelGrid[idx].age = 0;
+                    update();
                 }
-            } else if (event->button() == Qt::MiddleButton) {
-                if (hitVoxel) {
-                    currentTextureIdx = hitTexId;
+            }
+        } else if (event->button() == Qt::RightButton) {
+            if (hitVoxel) removeVoxelAt(hitBlock);
+        } else if (event->button() == Qt::MiddleButton) {
+            if (hitVoxel && hitFace >= 0) {
+                int idx = voxelIndexFromWorld(hitBlock);
+                if (idx >= 0) {
+                    currentTextureIdx = voxelGrid[idx].faces[hitFace].texId;
                     updateInfoLabel();
-                    qDebug() << "Picked block type:" << currentTextureIdx;
                     update();
                 }
             }
         }
     }
 
+    void mouseReleaseEvent(QMouseEvent *event) override {
+        if (firstPerson && event->button() == Qt::RightButton && !rightDragged) {
+            QVector3D origin, dir;
+            getViewRay(QPointF(width()/2.0, height()/2.0), origin, dir);
+            QVector3D hb, ab; int t, f;
+            if (raycastVoxel(origin, dir, hb, ab, t, f)) removeVoxelAt(hb);
+        }
+    }
+
     void wheelEvent(QWheelEvent *event) override {
-        distance -= event->angleDelta().y() / 120.0f * 2.0f;
-        if (distance < 2.0f) distance = 2.0f;
-        if (distance > 50.0f) distance = 50.0f;
-        update();
+        if (!firstPerson) {
+            distance -= event->angleDelta().y() / 120.0f * 2.0f;
+            if (distance < 2.0f) distance = 2.0f;
+            if (distance > 50.0f) distance = 50.0f;
+            update();
+        }
     }
 
     void mouseMoveEvent(QMouseEvent *event) override {
-        if (event->buttons() & Qt::MiddleButton) {
-            float dx = event->x() - lastMousePosition.x();
-            float dy = event->y() - lastMousePosition.y();
+        float dx = event->x() - lastMousePosition.x();
+        float dy = event->y() - lastMousePosition.y();
 
+        if (firstPerson) {
+            if (event->buttons() & Qt::RightButton) {
+                if ((event->pos() - rightPressPos).manhattanLength() > 4) rightDragged = true;
+                fpYaw += dx * 0.3f;
+                fpPitch -= dy * 0.3f;
+                if (fpPitch > 89.0f) fpPitch = 89.0f;
+                if (fpPitch < -89.0f) fpPitch = -89.0f;
+                update();
+            }
+        } else if (event->buttons() & Qt::MiddleButton) {
             yaw += dx * 0.5f;
             pitch += dy * 0.5f;
-
             if (pitch > 89.0f) pitch = 89.0f;
             if (pitch < -89.0f) pitch = -89.0f;
-
             update();
         }
         lastMousePosition = event->pos();
@@ -209,12 +352,18 @@ protected:
 
     void keyPressEvent(QKeyEvent *event) override {
         pressedKeys.insert(event->key());
-        if (event->key() >= Qt::Key_1 && event->key() <= Qt::Key_5) {
+
+        if (event->key() >= Qt::Key_1 && event->key() <= Qt::Key_6) {
             currentTextureIdx = event->key() - Qt::Key_1;
             updateInfoLabel();
-            qDebug() << "Selected Texture ID:" << currentTextureIdx;
-            update();
         }
+        if (event->key() == Qt::Key_F) {
+            firstPerson = !firstPerson;
+            if (firstPerson) { fpYaw = yaw + 180.0f; fpPitch = 0.0f; }
+            updateInfoLabel();
+        }
+        if (event->key() == Qt::Key_E) assignInteractionToFace();
+        update();
     }
 
     void keyReleaseEvent(QKeyEvent *event) override {
@@ -222,259 +371,344 @@ protected:
     }
 
 private:
-    void updateInfoLabel() {
-        if (infoLabel) {
-            QStringList names = {"Dirt", "Stone", "Grass", "Brick", "Sand"};
-            infoLabel->setText("Selected: " + names[currentTextureIdx] + " | Left: Place | Right: Remove | WASD: Move | Space: Jump | 1-5: Texture");
-        }
+    // ---------- TEXTURES ----------
+    int getTextureForPath(const QString& path) {
+        if (customTextureCache.contains(path)) return customTextureCache[path];
+        QImage img(path);
+        if (img.isNull()) { qWarning() << "Could not load image:" << path; return 5; }
+
+        // Scale to power-of-two + flip vertically for OpenGL
+        QImage gl = img.scaled(256, 256, Qt::IgnoreAspectRatio, Qt::SmoothTransformation)
+                       .mirrored(false, true)
+                       .convertToFormat(QImage::Format_RGBA8888);
+
+        GLuint tex;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, gl.width(), gl.height(), 0, GL_RGBA, GL_UNSIGNED_BYTE, gl.bits());
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+        int idx = (int)textures.size();
+        textures.push_back(tex);
+        customTextureCache[path] = idx;
+        qDebug() << "Loaded poster texture:" << path << "as index" << idx;
+        return idx;
     }
 
     GLuint createTexture(QColor baseColor, const QString& name) {
         QImage img(64, 64, QImage::Format_RGBA8888);
         img.fill(baseColor);
-
-        for(int i=0; i<64; ++i) {
-            for(int j=0; j<64; ++j) {
-                QColor c = baseColor;
-                if (name == "Brick") {
-                    if (i % 16 == 0 || j % 32 == 0 || (j % 32 == 16 && i % 32 > 15)) {
-                        c = QColor(200, 200, 200);
-                    }
-                } else {
-                    int noise = (qrand() % 40) - 20;
-                    c = QColor(qBound(0, c.red() + noise, 255),
-                               qBound(0, c.green() + noise, 255),
-                               qBound(0, c.blue() + noise, 255));
-                    if (i==0 || i==63 || j==0 || j==63) c = c.darker(150);
-                }
-                img.setPixelColor(i, j, c);
+        for(int i=0; i<64; ++i) for(int j=0; j<64; ++j) {
+            QColor c = baseColor;
+            if (name == "Brick") {
+                if (i % 16 == 0 || j % 32 == 0 || (j % 32 == 16 && i % 32 > 15)) c = QColor(200,200,200);
+            } else if (name == "Poster") {
+                if (i < 4 || i > 59 || j < 4 || j > 59) c = QColor(20,20,80);
+                else if (i > 20 && i < 44 && j > 10 && j < 54) c = QColor(255,255,200);
+                else c = QColor(40,40,120);
+            } else {
+                int noise = (qrand() % 40) - 20;
+                c = QColor(qBound(0, c.red()+noise, 255), qBound(0, c.green()+noise, 255), qBound(0, c.blue()+noise, 255));
+                if (i==0 || i==63 || j==0 || j==63) c = c.darker(150);
             }
+            img.setPixelColor(i, j, c);
         }
         GLuint tex;
         glGenTextures(1, &tex);
         glBindTexture(GL_TEXTURE_2D, tex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, img.width(), img.height(), 0, GL_RGBA, GL_UNSIGNED_BYTE, img.bits());
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 64, 64, 0, GL_RGBA, GL_UNSIGNED_BYTE, img.bits());
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         return tex;
     }
 
-    QVector3D getRayOrigin(const QPointF &mousePos) {
-        float eyeX = target.x() + distance * cos(pitch * M_PI / 180.0f) * cos(yaw * M_PI / 180.0f);
-        float eyeY = target.y() + distance * cos(pitch * M_PI / 180.0f) * sin(yaw * M_PI / 180.0f);
-        float eyeZ = target.z() + distance * sin(pitch * M_PI / 180.0f);
-        return QVector3D(eyeX, eyeY, eyeZ);
+    // ---------- FACE ASSIGNMENT ----------
+    void assignInteractionToFace() {
+        QVector3D origin, dir;
+        getViewRay(firstPerson ? QPointF(width()/2.0, height()/2.0) : QPointF(lastMousePosition), origin, dir);
+
+        QVector3D hb, ab; int t, hitFace;
+        if (!raycastVoxel(origin, dir, hb, ab, t, hitFace)) return;
+        int idx = voxelIndexFromWorld(hb);
+        if (idx < 0) return;
+
+        bool ok = false;
+        QStringList options;
+        options << "Movie poster (image + URL)" << "Image texture only" << "URL link only" << "Clear assignment";
+        QString choice = QInputDialog::getItem(this, "Assign to Face", "What should this face do?", options, 0, false, &ok);
+        if (!ok) { pressedKeys.clear(); return; }
+
+        FaceData& fd = voxelGrid[idx].faces[hitFace];
+        makeCurrent();
+
+        if (choice == options[0] || choice == options[1]) {
+            QString imgPath = QFileDialog::getOpenFileName(this, "Choose Poster Image", "",
+                "Images (*.png *.jpg *.jpeg *.bmp *.gif);;All Files (*)");
+            if (!imgPath.isEmpty()) {
+                fd.imagePath = imgPath;
+                fd.texId = getTextureForPath(imgPath);
+            } else if (choice == options[0]) {
+                fd.texId = 5; // fallback procedural poster
+            }
+        }
+        if (choice == options[0] || choice == options[2]) {
+            if (choice == options[2]) fd.texId = 5;
+            bool ok2 = false;
+            QString url = QInputDialog::getText(this, "Assign URL / Movie",
+                "URL or local file to open when triggered:", QLineEdit::Normal, "https://", &ok2);
+            if (ok2 && !url.isEmpty()) {
+                fd.interactive = true;
+                fd.interactionType = 1;
+                fd.url = url;
+            }
+        }
+        if (choice == options[3]) {
+            fd = FaceData();
+            fd.texId = currentTextureIdx;
+        }
+
+        doneCurrent();
+        pressedKeys.clear(); // avoid stuck keys after modal dialogs
+        updateInfoLabel();
+        update();
     }
 
-    QVector3D getRayDirection(const QPointF &mousePos) {
-        QVector3D eye = getRayOrigin(mousePos);
-        QVector3D forward = (target - eye).normalized();
-        QVector3D worldUp(0.0, 0.0, 1.0);
-        QVector3D right = QVector3D::crossProduct(forward, worldUp).normalized();
+    void triggerInteraction(int voxelIdx, int face) {
+        qint64 now = QDateTime::currentMSecsSinceEpoch();
+        if (now - lastInteractionTime < 2000) return;
+        lastInteractionTime = now;
+
+        FaceData& fd = voxelGrid[voxelIdx].faces[face];
+        if (fd.interactive && fd.interactionType == 1) {
+            QUrl u = fd.url.startsWith("http", Qt::CaseInsensitive) ? QUrl(fd.url) : QUrl::fromLocalFile(fd.url);
+            qDebug() << "Opening:" << u.toString();
+            QDesktopServices::openUrl(u);
+        }
+    }
+
+    // ---------- HELPERS ----------
+    int voxelIndexFromWorld(const QVector3D& wb) {
+        int x = wb.x() + gridSize/2.0f, y = wb.y() + gridSize/2.0f, z = wb.z();
+        if (x < 0 || x >= gridSize || y < 0 || y >= gridSize || z < 0 || z >= gridSize) return -1;
+        return index(x, y, z);
+    }
+
+    void removeVoxelAt(const QVector3D& wb) {
+        int idx = voxelIndexFromWorld(wb);
+        if (idx >= 0) { voxelGrid[idx].active = false; update(); }
+    }
+
+    void getViewRay(const QPointF& mousePos, QVector3D& origin, QVector3D& dir) {
+        if (firstPerson) {
+            origin = QVector3D(player.pos.x(), player.pos.y(), player.pos.z() + 1.2f);
+            dir = QVector3D(cos(fpPitch*M_PI/180.0f)*cos(fpYaw*M_PI/180.0f),
+                            cos(fpPitch*M_PI/180.0f)*sin(fpYaw*M_PI/180.0f),
+                            sin(fpPitch*M_PI/180.0f)).normalized();
+            return;
+        }
+        float eyeX = target.x() + distance * cos(pitch*M_PI/180.0f) * cos(yaw*M_PI/180.0f);
+        float eyeY = target.y() + distance * cos(pitch*M_PI/180.0f) * sin(yaw*M_PI/180.0f);
+        float eyeZ = target.z() + distance * sin(pitch*M_PI/180.0f);
+        origin = QVector3D(eyeX, eyeY, eyeZ);
+
+        QVector3D forward = (target - origin).normalized();
+        QVector3D right = QVector3D::crossProduct(forward, QVector3D(0,0,1)).normalized();
         QVector3D up = QVector3D::crossProduct(right, forward).normalized();
 
-        float w = width();
-        float h = height();
-        if (w <= 0) w = 800;
-        if (h <= 0) h = 600;
-
+        float w = width(); if (w <= 0) w = 800;
+        float h = height(); if (h <= 0) h = 600;
         float ndcX = (2.0f * mousePos.x() / w) - 1.0f;
         float ndcY = 1.0f - (2.0f * mousePos.y() / h);
-        float aspect = w / h;
-        float tanFov = tan(45.0f * 0.5f * M_PI / 180.0f);
+        float tanFov = tan(60.0f * 0.5f * M_PI / 180.0f);
 
-        QVector3D rayDirLocal(ndcX * aspect * tanFov, ndcY * tanFov, -1.0f);
-        return (right * rayDirLocal.x() + up * rayDirLocal.y() + forward).normalized();
+        dir = (right * (ndcX * (w/h) * tanFov) + up * (ndcY * tanFov) + forward).normalized();
     }
 
-    bool raycastVoxel(QVector3D origin, QVector3D dir, QVector3D &hitBlockWorld, QVector3D &adjacentWorld, int &hitTexId) {
-        QVector3D gridOrigin = QVector3D(origin.x() + gridSize / 2.0f, origin.y() + gridSize / 2.0f, origin.z());
-        gridOrigin += dir * 0.0001f;
+    bool raycastVoxel(QVector3D origin, QVector3D dir, QVector3D &hitBlockWorld,
+                      QVector3D &adjacentWorld, int &hitTexId, int &hitFace) {
+        QVector3D g(origin.x() + gridSize/2.0f, origin.y() + gridSize/2.0f, origin.z());
+        g += dir * 0.0001f;
 
-        int x = floor(gridOrigin.x());
-        int y = floor(gridOrigin.y());
-        int z = floor(gridOrigin.z());
-
+        int x = floor(g.x()), y = floor(g.y()), z = floor(g.z());
         int stepX = (dir.x() > 0) ? 1 : ((dir.x() < 0) ? -1 : 0);
         int stepY = (dir.y() > 0) ? 1 : ((dir.y() < 0) ? -1 : 0);
         int stepZ = (dir.z() > 0) ? 1 : ((dir.z() < 0) ? -1 : 0);
 
-        float tDeltaX = (stepX != 0) ? std::abs(1.0f / dir.x()) : 1e30f;
-        float tDeltaY = (stepY != 0) ? std::abs(1.0f / dir.y()) : 1e30f;
-        float tDeltaZ = (stepZ != 0) ? std::abs(1.0f / dir.z()) : 1e30f;
+        float tDX = stepX ? std::abs(1.0f/dir.x()) : 1e30f;
+        float tDY = stepY ? std::abs(1.0f/dir.y()) : 1e30f;
+        float tDZ = stepZ ? std::abs(1.0f/dir.z()) : 1e30f;
 
-        float tMaxX, tMaxY, tMaxZ;
-        if (stepX > 0) tMaxX = (x + 1.0f - gridOrigin.x()) * tDeltaX;
-        else if (stepX < 0) tMaxX = (gridOrigin.x() - x) * tDeltaX;
-        else tMaxX = 1e30f;
+        float tMX = stepX > 0 ? (x+1.0f-g.x())*tDX : stepX < 0 ? (g.x()-x)*tDX : 1e30f;
+        float tMY = stepY > 0 ? (y+1.0f-g.y())*tDY : stepY < 0 ? (g.y()-y)*tDY : 1e30f;
+        float tMZ = stepZ > 0 ? (z+1.0f-g.z())*tDZ : stepZ < 0 ? (g.z()-z)*tDZ : 1e30f;
 
-        if (stepY > 0) tMaxY = (y + 1.0f - gridOrigin.y()) * tDeltaY;
-        else if (stepY < 0) tMaxY = (gridOrigin.y() - y) * tDeltaY;
-        else tMaxY = 1e30f;
-
-        if (stepZ > 0) tMaxZ = (z + 1.0f - gridOrigin.z()) * tDeltaZ;
-        else if (stepZ < 0) tMaxZ = (gridOrigin.z() - z) * tDeltaZ;
-        else tMaxZ = 1e30f;
-
-        int prevX = x, prevY = y, prevZ = z;
+        int px = x, py = y, pz = z, lastAxis = -1, lastDir = 0;
 
         for (int i = 0; i < 300; ++i) {
-            if (x < -5 || x >= gridSize + 5 || y < -5 || y >= gridSize + 5 || z < -5 || z >= gridSize + 5) break;
-
+            if (x < -5 || x >= gridSize+5 || y < -5 || y >= gridSize+5 || z < -5 || z >= gridSize+5) break;
             if (x >= 0 && x < gridSize && y >= 0 && y < gridSize && z >= 0 && z < gridSize) {
                 int idx = index(x, y, z);
                 if (voxelGrid[idx].active) {
                     hitBlockWorld = QVector3D(x - gridSize/2.0f, y - gridSize/2.0f, z);
-                    adjacentWorld = QVector3D(prevX - gridSize/2.0f, prevY - gridSize/2.0f, prevZ);
-                    hitTexId = voxelGrid[idx].texId;
+                    adjacentWorld = QVector3D(px - gridSize/2.0f, py - gridSize/2.0f, pz);
+                    hitTexId = voxelGrid[idx].faces[0].texId;
+                    if (lastAxis == 0) hitFace = lastDir > 0 ? FACE_X_NEG : FACE_X_POS;
+                    else if (lastAxis == 1) hitFace = lastDir > 0 ? FACE_Y_NEG : FACE_Y_POS;
+                    else if (lastAxis == 2) hitFace = lastDir > 0 ? FACE_Z_NEG : FACE_Z_POS;
+                    else hitFace = 0;
                     return true;
                 }
             }
-
-            prevX = x; prevY = y; prevZ = z;
-
-            if (tMaxX < tMaxY) {
-                if (tMaxX < tMaxZ) { x += stepX; tMaxX += tDeltaX; }
-                else { z += stepZ; tMaxZ += tDeltaZ; }
+            px = x; py = y; pz = z;
+            if (tMX < tMY) {
+                if (tMX < tMZ) { x += stepX; tMX += tDX; lastAxis = 0; lastDir = stepX; }
+                else           { z += stepZ; tMZ += tDZ; lastAxis = 2; lastDir = stepZ; }
             } else {
-                if (tMaxY < tMaxZ) { y += stepY; tMaxY += tDeltaY; }
-                else { z += stepZ; tMaxZ += tDeltaZ; }
+                if (tMY < tMZ) { y += stepY; tMY += tDY; lastAxis = 1; lastDir = stepY; }
+                else           { z += stepZ; tMZ += tDZ; lastAxis = 2; lastDir = stepZ; }
             }
         }
         return false;
     }
 
     void updatePhysics() {
-        QTime currentTime = QTime::currentTime();
-        float dt = lastTime.msecsTo(currentTime) / 1000.0f;
+        QTime now = QTime::currentTime();
+        float dt = lastTime.msecsTo(now) / 1000.0f;
         if (dt > 0.1f) dt = 0.1f;
-        lastTime = currentTime;
+        lastTime = now;
 
-        // Calculate movement vectors relative to the camera
-        QVector3D eye = getRayOrigin(QPointF(width()/2.0, height()/2.0));
-        QVector3D forward = target - eye;
-        forward.setZ(0); // Project onto XY plane for horizontal movement
-        if (forward.length() > 0.001f) forward.normalize();
-        QVector3D right = QVector3D::crossProduct(forward, QVector3D(0,0,1)).normalized();
+        QVector3D fwd, rgt;
+        if (firstPerson) {
+            fwd = QVector3D(cos(fpYaw*M_PI/180.0f), sin(fpYaw*M_PI/180.0f), 0);
+            rgt = QVector3D(-sin(fpYaw*M_PI/180.0f), cos(fpYaw*M_PI/180.0f), 0);
+        } else {
+            QVector3D eye; getViewRay(QPointF(width()/2.0, height()/2.0), eye, fwd);
+            fwd = target - eye; fwd.setZ(0);
+            if (fwd.length() > 0.001f) fwd.normalize();
+            rgt = QVector3D::crossProduct(fwd, QVector3D(0,0,1)).normalized();
+        }
 
         QVector3D moveDir(0,0,0);
-        if (pressedKeys.contains(Qt::Key_W)) moveDir = moveDir + forward;
-        if (pressedKeys.contains(Qt::Key_S)) moveDir = moveDir - forward;
-        if (pressedKeys.contains(Qt::Key_A)) moveDir = moveDir - right;
-        if (pressedKeys.contains(Qt::Key_D)) moveDir = moveDir + right;
+        if (pressedKeys.contains(Qt::Key_W)) moveDir += fwd;
+        if (pressedKeys.contains(Qt::Key_S)) moveDir -= fwd;
+        if (pressedKeys.contains(Qt::Key_A)) moveDir -= rgt;
+        if (pressedKeys.contains(Qt::Key_D)) moveDir += rgt;
 
         if (moveDir.length() > 0) {
             moveDir.normalize();
             player.vel.setX(player.vel.x() + moveDir.x() * 25.0f * dt);
             player.vel.setY(player.vel.y() + moveDir.y() * 25.0f * dt);
         }
-
-        player.vel.setZ(player.vel.z() - 25.0f * dt); // gravity
-
-        float damp = 1.0f - 10.0f * dt;
-        if (damp < 0) damp = 0;
+        player.vel.setZ(player.vel.z() - 25.0f * dt);
+        float damp = 1.0f - 10.0f * dt; if (damp < 0) damp = 0;
         player.vel.setX(player.vel.x() * damp);
         player.vel.setY(player.vel.y() * damp);
 
-        QVector3D nextPos = player.pos + player.vel * dt;
+        QVector3D np = player.pos + player.vel * dt;
         float r = 0.4f;
-
-        bool collided_wall = false;
         bool onGround = false;
 
-        int minX = floor(nextPos.x() + gridSize/2.0f - r);
-        int maxX = ceil(nextPos.x() + gridSize/2.0f + r);
-        int minY = floor(nextPos.y() + gridSize/2.0f - r);
-        int maxY = ceil(nextPos.y() + gridSize/2.0f + r);
-        int minZ = floor(nextPos.z() - r);
-        int maxZ = ceil(nextPos.z() + r);
+        int minX = floor(np.x() + gridSize/2.0f - r), maxX = ceil(np.x() + gridSize/2.0f + r);
+        int minY = floor(np.y() + gridSize/2.0f - r), maxY = ceil(np.y() + gridSize/2.0f + r);
+        int minZ = floor(np.z() - r), maxZ = ceil(np.z() + r);
 
-        for(int x = minX; x <= maxX; ++x) {
-            for(int y = minY; y <= maxY; ++y) {
-                for(int z = minZ; z <= maxZ; ++z) {
-                    if (x>=0 && x<gridSize && y>=0 && y<gridSize && z>=0 && z<gridSize) {
-                        int idx = index(x,y,z);
-                        if (voxelGrid[idx].active) {
-                            float vMinX = x - gridSize/2.0f, vMaxX = x - gridSize/2.0f + 1.0f;
-                            float vMinY = y - gridSize/2.0f, vMaxY = y - gridSize/2.0f + 1.0f;
-                            float vMinZ = z, vMaxZ = z + 1.0f;
+        for(int bx = minX; bx <= maxX; ++bx)
+        for(int by = minY; by <= maxY; ++by)
+        for(int bz = minZ; bz <= maxZ; ++bz) {
+            if (bx<0 || bx>=gridSize || by<0 || by>=gridSize || bz<0 || bz>=gridSize) continue;
+            int idx = index(bx,by,bz);
+            if (!voxelGrid[idx].active) continue;
 
-                            if (nextPos.x() + r > vMinX && nextPos.x() - r < vMaxX &&
-                                nextPos.y() + r > vMinY && nextPos.y() - r < vMaxY &&
-                                nextPos.z() + r > vMinZ && nextPos.z() - r < vMaxZ) {
+            float vMinX = bx - gridSize/2.0f, vMaxX = vMinX + 1.0f;
+            float vMinY = by - gridSize/2.0f, vMaxY = vMinY + 1.0f;
+            float vMinZ = bz, vMaxZ = bz + 1.0f;
 
-                                QVector3D blockCenter(vMinX + 0.5f, vMinY + 0.5f, vMinZ + 0.5f);
-                                QVector3D diff = nextPos - blockCenter;
+            if (np.x()+r > vMinX && np.x()-r < vMaxX &&
+                np.y()+r > vMinY && np.y()-r < vMaxY &&
+                np.z()+r > vMinZ && np.z()-r < vMaxZ) {
 
-                                // Collision logic for floors/ceilings vs walls
-                                if (std::abs(diff.z()) > std::abs(diff.x()) && std::abs(diff.z()) > std::abs(diff.y())) {
-                                    if (diff.z() > 0) {
-                                        nextPos.setZ(vMaxZ + r);
-                                        player.vel.setZ(0);
-                                        onGround = true;
-                                    } else {
-                                        nextPos.setZ(vMinZ - r);
-                                        player.vel.setZ(0);
-                                    }
-                                } else {
-                                    collided_wall = true;
-                                    int wallType = voxelGrid[idx].getType();
-                                    qDebug() << "Entity touched a wall! Block type:" << wallType << "Age:" << voxelGrid[idx].getAge();
+                QVector3D c(vMinX+0.5f, vMinY+0.5f, vMinZ+0.5f);
+                QVector3D diff = np - c;
 
-                                    if (std::abs(diff.x()) > std::abs(diff.y())) {
-                                        nextPos.setX(diff.x() > 0 ? vMaxX + r : vMinX - r);
-                                        player.vel.setX(0);
-                                    } else {
-                                        nextPos.setY(diff.y() > 0 ? vMaxY + r : vMinY - r);
-                                        player.vel.setY(0);
-                                    }
-                                }
-                            }
-                        }
+                if (std::abs(diff.z()) > std::abs(diff.x()) && std::abs(diff.z()) > std::abs(diff.y())) {
+                    if (diff.z() > 0) { np.setZ(vMaxZ + r); player.vel.setZ(0); onGround = true; }
+                    else              { np.setZ(vMinZ - r); player.vel.setZ(0); }
+                } else {
+                    int hitFace;
+                    if (std::abs(diff.x()) > std::abs(diff.y())) {
+                        hitFace = diff.x() > 0 ? FACE_X_NEG : FACE_X_POS;
+                        np.setX(diff.x() > 0 ? vMaxX + r : vMinX - r);
+                        player.vel.setX(0);
+                    } else {
+                        hitFace = diff.y() > 0 ? FACE_Y_NEG : FACE_Y_POS;
+                        np.setY(diff.y() > 0 ? vMaxY + r : vMinY - r);
+                        player.vel.setY(0);
                     }
+                    if (voxelGrid[idx].faces[hitFace].interactive) triggerInteraction(idx, hitFace);
                 }
             }
         }
 
-        if (pressedKeys.contains(Qt::Key_Space) && onGround) {
-            player.vel.setZ(12.0f);
-        }
+        if (pressedKeys.contains(Qt::Key_Space) && onGround) player.vel.setZ(12.0f);
+        if (np.z() < -10.0f) { np.setZ(3.0f); player.vel.setZ(0); }
+        player.pos = np;
+    }
 
-        if (nextPos.z() < -10.0f) { nextPos.setZ(3.0f); player.vel.setZ(0); }
-        player.pos = nextPos;
+    void updateInfoLabel() {
+        if (!infoLabel) return;
+        QStringList names = {"Dirt", "Stone", "Grass", "Brick", "Sand", "Poster"};
+        QString sel = currentTextureIdx < names.size() ? names[currentTextureIdx] : "Custom";
+        infoLabel->setText(QString("[%1] Tex: %2 | F: View | E: Assign Face | Ctrl+S/O: Save/Load | WASD+Space | 1-6: Tex")
+            .arg(firstPerson ? "FIRST PERSON" : "ORBIT").arg(sel));
+    }
+
+    void drawFace(int face) {
+        glBegin(GL_QUADS);
+        switch(face) {
+        case FACE_X_NEG:
+            glTexCoord2f(0,0); glVertex3f(-0.5,-0.5,-0.5); glTexCoord2f(1,0); glVertex3f(-0.5,-0.5,0.5);
+            glTexCoord2f(1,1); glVertex3f(-0.5,0.5,0.5);  glTexCoord2f(0,1); glVertex3f(-0.5,0.5,-0.5); break;
+        case FACE_X_POS:
+            glTexCoord2f(0,0); glVertex3f(0.5,-0.5,-0.5); glTexCoord2f(1,0); glVertex3f(0.5,-0.5,0.5);
+            glTexCoord2f(1,1); glVertex3f(0.5,0.5,0.5);   glTexCoord2f(0,1); glVertex3f(0.5,0.5,-0.5); break;
+        case FACE_Y_NEG:
+            glTexCoord2f(0,0); glVertex3f(-0.5,-0.5,-0.5); glTexCoord2f(1,0); glVertex3f(0.5,-0.5,-0.5);
+            glTexCoord2f(1,1); glVertex3f(0.5,0.5,-0.5);   glTexCoord2f(0,1); glVertex3f(-0.5,0.5,-0.5); break;
+        case FACE_Y_POS:
+            glTexCoord2f(0,0); glVertex3f(-0.5,-0.5,0.5); glTexCoord2f(1,0); glVertex3f(0.5,-0.5,0.5);
+            glTexCoord2f(1,1); glVertex3f(0.5,0.5,0.5);   glTexCoord2f(0,1); glVertex3f(-0.5,0.5,0.5); break;
+        case FACE_Z_NEG:
+            glTexCoord2f(0,0); glVertex3f(-0.5,-0.5,-0.5); glTexCoord2f(1,0); glVertex3f(0.5,-0.5,-0.5);
+            glTexCoord2f(1,1); glVertex3f(0.5,-0.5,0.5);   glTexCoord2f(0,1); glVertex3f(-0.5,-0.5,0.5); break;
+        case FACE_Z_POS:
+            glTexCoord2f(0,0); glVertex3f(-0.5,0.5,-0.5); glTexCoord2f(1,0); glVertex3f(0.5,0.5,-0.5);
+            glTexCoord2f(1,1); glVertex3f(0.5,0.5,0.5);   glTexCoord2f(0,1); glVertex3f(-0.5,0.5,0.5); break;
+        }
+        glEnd();
     }
 
     void drawVoxel(int x, int y, int z) {
         int idx = index(x, y, z);
-        int type = voxelGrid[idx].texId;
-
         glPushMatrix();
-        glTranslatef(x - gridSize / 2.0f, y - gridSize / 2.0f, z);
-
+        glTranslatef(x - gridSize/2.0f, y - gridSize/2.0f, z);
         glEnable(GL_TEXTURE_2D);
-        glBindTexture(GL_TEXTURE_2D, textures[type]);
-        glColor3f(1.0, 1.0, 1.0); // Pure white so textures aren't tinted
-
-        glBegin(GL_QUADS);
-        // Front
-        glTexCoord2f(0,0); glVertex3f(-0.5, -0.5, 0.5); glTexCoord2f(1,0); glVertex3f( 0.5, -0.5, 0.5);
-        glTexCoord2f(1,1); glVertex3f( 0.5, 0.5, 0.5); glTexCoord2f(0,1); glVertex3f(-0.5, 0.5, 0.5);
-        // Back
-        glTexCoord2f(0,0); glVertex3f(-0.5, -0.5, -0.5); glTexCoord2f(1,0); glVertex3f( 0.5, -0.5, -0.5);
-        glTexCoord2f(1,1); glVertex3f( 0.5, 0.5, -0.5); glTexCoord2f(0,1); glVertex3f(-0.5, 0.5, -0.5);
-        // Left
-        glTexCoord2f(0,0); glVertex3f(-0.5, -0.5, -0.5); glTexCoord2f(1,0); glVertex3f(-0.5, -0.5, 0.5);
-        glTexCoord2f(1,1); glVertex3f(-0.5, 0.5, 0.5); glTexCoord2f(0,1); glVertex3f(-0.5, 0.5, -0.5);
-        // Right
-        glTexCoord2f(0,0); glVertex3f(0.5, -0.5, -0.5); glTexCoord2f(1,0); glVertex3f(0.5, -0.5, 0.5);
-        glTexCoord2f(1,1); glVertex3f(0.5, 0.5, 0.5); glTexCoord2f(0,1); glVertex3f(0.5, 0.5, -0.5);
-        // Top
-        glTexCoord2f(0,0); glVertex3f(-0.5, 0.5, -0.5); glTexCoord2f(1,0); glVertex3f( 0.5, 0.5, -0.5);
-        glTexCoord2f(1,1); glVertex3f( 0.5, 0.5, 0.5); glTexCoord2f(0,1); glVertex3f(-0.5, 0.5, 0.5);
-        // Bottom
-        glTexCoord2f(0,0); glVertex3f(-0.5, -0.5, -0.5); glTexCoord2f(1,0); glVertex3f( 0.5, -0.5, -0.5);
-        glTexCoord2f(1,1); glVertex3f( 0.5, -0.5, 0.5); glTexCoord2f(0,1); glVertex3f(-0.5, -0.5, 0.5);
-        glEnd();
+        for (int f = 0; f < 6; f++) {
+            const FaceData& fd = voxelGrid[idx].faces[f];
+            int t = fd.texId;
+            if (t < 0 || t >= (int)textures.size()) t = 0;
+            glBindTexture(GL_TEXTURE_2D, textures[t]);
+            glColor3f(1.0f, 1.0f, 1.0f);
+            drawFace(f);
+            if (fd.interactive) { // highlight border for interactive faces
+                glDisable(GL_TEXTURE_2D);
+                glColor4f(0.2f, 0.6f, 1.0f, 0.35f);
+                drawFace(f);
+                glEnable(GL_TEXTURE_2D);
+            }
+        }
         glDisable(GL_TEXTURE_2D);
         glPopMatrix();
     }
@@ -482,21 +716,15 @@ private:
     void drawPlayer() {
         glPushMatrix();
         glTranslatef(player.pos.x(), player.pos.y(), player.pos.z());
-        glColor3f(1.0f, 1.0f, 0.0f); // Yellow player
+        glColor3f(1.0f, 1.0f, 0.0f);
         glBegin(GL_QUADS);
         float r = 0.4f;
-        // Front
-        glVertex3f(-r, -r, r); glVertex3f(r, -r, r); glVertex3f(r, r, r); glVertex3f(-r, r, r);
-        // Back
-        glVertex3f(-r, -r, -r); glVertex3f(r, -r, -r); glVertex3f(r, r, -r); glVertex3f(-r, r, -r);
-        // Left
-        glVertex3f(-r, -r, -r); glVertex3f(-r, -r, r); glVertex3f(-r, r, r); glVertex3f(-r, r, -r);
-        // Right
-        glVertex3f(r, -r, -r); glVertex3f(r, -r, r); glVertex3f(r, r, r); glVertex3f(r, r, -r);
-        // Top
-        glVertex3f(-r, r, -r); glVertex3f(r, r, -r); glVertex3f(r, r, r); glVertex3f(-r, r, r);
-        // Bottom
-        glVertex3f(-r, -r, -r); glVertex3f(r, -r, -r); glVertex3f(r, -r, r); glVertex3f(-r, -r, r);
+        glVertex3f(-r,-r,r); glVertex3f(r,-r,r); glVertex3f(r,r,r); glVertex3f(-r,r,r);
+        glVertex3f(-r,-r,-r); glVertex3f(r,-r,-r); glVertex3f(r,r,-r); glVertex3f(-r,r,-r);
+        glVertex3f(-r,-r,-r); glVertex3f(-r,-r,r); glVertex3f(-r,r,r); glVertex3f(-r,r,-r);
+        glVertex3f(r,-r,-r); glVertex3f(r,-r,r); glVertex3f(r,r,r); glVertex3f(r,r,-r);
+        glVertex3f(-r,r,-r); glVertex3f(r,r,-r); glVertex3f(r,r,r); glVertex3f(-r,r,r);
+        glVertex3f(-r,-r,-r); glVertex3f(r,-r,-r); glVertex3f(r,-r,r); glVertex3f(-r,-r,r);
         glEnd();
         glPopMatrix();
     }
@@ -504,16 +732,20 @@ private:
     int index(int x, int y, int z) const { return x + gridSize * (y + gridSize * z); }
 
     int gridSize;
-    float distance, yaw, pitch;
+    float distance, yaw, pitch, fpYaw, fpPitch;
+    bool firstPerson;
     int currentTextureIdx;
     QVector3D target;
     QSet<int> pressedKeys;
-    QPoint lastMousePosition;
+    QPoint lastMousePosition, rightPressPos;
+    bool rightDragged = false;
     std::vector<Voxel> voxelGrid;
     std::vector<GLuint> textures;
+    QMap<QString, int> customTextureCache;
     Entity player;
     QTime lastTime;
     QLabel* infoLabel = nullptr;
+    qint64 lastInteractionTime;
 };
 
 int main(int argc, char *argv[]) {
@@ -528,14 +760,22 @@ int main(int argc, char *argv[]) {
     OpenGLWidget* glWidget = new OpenGLWidget();
     layout->addWidget(glWidget);
 
-    QLabel* lbl = new QLabel("Selected: Dirt | Left: Place | Right: Remove | Middle Click: Pick | Middle Drag: Rotate | Scroll: Zoom | WASD: Move | Space: Jump | 1-5: Texture");
-    lbl->setStyleSheet("color: yellow; background: rgba(0,0,0,150); padding: 5px; font-weight: bold;");
+    QLabel* lbl = new QLabel("[ORBIT] F: View | E: Assign Face | Ctrl+S/O: Save/Load | WASD+Space | 1-6: Tex");
+    lbl->setStyleSheet("color: yellow; background: rgba(0,0,0,180); padding: 5px; font-weight: bold;");
     layout->addWidget(lbl);
-
     glWidget->setInfoLabel(lbl);
 
     w.setCentralWidget(central);
-    w.resize(800, 600);
+
+    QMenu* fileMenu = w.menuBar()->addMenu("&File");
+    QAction* saveAct = fileMenu->addAction("Save World");
+    saveAct->setShortcut(QKeySequence("Ctrl+S"));
+    QObject::connect(saveAct, &QAction::triggered, glWidget, [glWidget]() { glWidget->saveWorld(); });
+    QAction* loadAct = fileMenu->addAction("Load World");
+    loadAct->setShortcut(QKeySequence("Ctrl+O"));
+    QObject::connect(loadAct, &QAction::triggered, glWidget, [glWidget]() { glWidget->loadWorld(); });
+
+    w.resize(900, 700);
     w.show();
     return a.exec();
 }
